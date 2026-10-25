@@ -1,0 +1,544 @@
+<!DOCTYPE html>
+<html lang="tr">
+<head>
+<meta charset="UTF-8">
+<title>FloorFlowers</title>
+<style>
+  * { box-sizing: border-box; }
+  body { margin: 0; background: #0a0a0a; display: flex; flex-direction: column; justify-content: center; align-items: center; min-height: 100vh; font-family: monospace; color: #fff; gap: 10px; padding: 10px; }
+  canvas { background: #000; border: 2px solid #333; max-width: 100%; }
+  #hud { display: flex; gap: 20px; font-size: 14px; align-items: center; flex-wrap: wrap; justify-content: center; }
+  #file-label { cursor: pointer; background: #333; padding: 6px 14px; border-radius: 4px; font-size: 14px; }
+  #file-label:hover { background: #444; }
+  input[type=file] { display: none; }
+  .warn { color: #ff6; font-size: 13px; }
+  .ok { color: #6f6; font-size: 13px; }
+  #bar { width: 800px; max-width: 100%; height: 6px; background: #222; position: relative; border-radius: 3px; overflow: hidden; }
+  #bar-fill { height: 100%; background: linear-gradient(90deg, #00ffcc, #ff0066); width: 0%; }
+  #debug { font-size: 11px; color: #666; text-align: center; max-width: 800px; }
+  #controls { display: flex; gap: 20px; align-items: center; font-size: 13px; flex-wrap: wrap; justify-content: center; background: #151515; padding: 8px 16px; border-radius: 6px; }
+  #controls label { display: flex; gap: 8px; align-items: center; }
+  input[type=range] { width: 120px; }
+  #combo-bar { width: 100px; height: 4px; background: #222; border-radius: 2px; overflow: hidden; }
+  #combo-fill { height: 100%; background: #00ffcc; width: 0%; transition: width 0.15s; }
+</style>
+</head>
+<body>
+<div id="hud">
+  <span>SPACE = Zıpla</span>
+  <span>SHIFT = Eğil</span>
+  <span>Puan: <span id="score">0</span></span>
+  <span>Kombo: <span id="combo">0</span> <span id="combo-bar"><span id="combo-fill"></span></span></span>
+</div>
+<label id="file-label">🎵 WAV Yükle <input type="file" id="file" accept=".wav,audio/wav,audio/*"></label>
+<div id="controls">
+  <label>Yoğunluk: <input type="range" id="density" min="0.3" max="1.2" step="0.05" value="0.7"> <span id="density-val">0.70</span></label>
+  <label><input type="checkbox" id="vibration" checked> Titreşim</label>
+</div>
+<div id="status" class="warn">Müzik yüklenmedi — boş tempoda oynuyorsun</div>
+<div id="bar"><div id="bar-fill"></div></div>
+<div id="debug"></div>
+<canvas id="game" width="800" height="400"></canvas>
+
+<script>
+// =========================================================
+// KURULUM
+// =========================================================
+const canvas = document.getElementById('game');
+const ctx = canvas.getContext('2d');
+const scoreEl = document.getElementById('score');
+const comboEl = document.getElementById('combo');
+const comboFill = document.getElementById('combo-fill');
+const statusEl = document.getElementById('status');
+const barFill = document.getElementById('bar-fill');
+const debugEl = document.getElementById('debug');
+const densitySlider = document.getElementById('density');
+const densityVal = document.getElementById('density-val');
+const vibrationToggle = document.getElementById('vibration');
+
+const W = canvas.width, H = canvas.height;
+const GROUND_Y = H * 0.7;
+const PIXELS_PER_SEC = 180;
+
+let time = 0;
+let score = 0;
+let combo = 0;
+let maxCombo = 0;
+let densityMultiplier = 0.7;
+
+const player = {
+  x: 150, y: GROUND_Y, vy: 0, size: 30,
+  ducking: false, onGround: true, hitCooldown: 0, squish: 0
+};
+
+let obstacles = [];
+let spawnTimer = 55;
+let speed = 5;
+let targetSpeed = 5;
+
+// Müzik durumu
+let audioCtx = null;
+let audioBuffer = null;
+let sourceNode = null;
+let playStartTime = 0;
+let musicPlaying = false;
+let musicDuration = 0;
+
+// Harita
+let allOnsets = [];         // tüm vuruşlar (titreşim için)
+let obstacleMap = [];       // engel haritası
+let nextOnsetIndex = 0;
+let activeVibrations = [];  // her frame hesaplanır
+let onsetBuckets = [];      // performans için zaman dilimlerine bölünmüş
+
+// =========================================================
+// 1) ONSET DETECTION
+// =========================================================
+async function analyzeOnsets(buffer) {
+  const sr = buffer.sampleRate;
+  const channel = buffer.getChannelData(0);
+  const winSize = 1024;
+  const hopSize = 512;
+
+  const hann = new Float32Array(winSize);
+  for (let i = 0; i < winSize; i++) {
+    hann[i] = 0.5 * (1 - Math.cos(2 * Math.PI * i / (winSize - 1)));
+  }
+
+  const numWindows = Math.floor((channel.length - winSize) / hopSize);
+  const flux = new Float32Array(numWindows);
+  let prevEnergy = 0;
+
+  for (let w = 0; w < numWindows; w++) {
+    const offset = w * hopSize;
+    let energy = 0, diffEnergy = 0;
+    for (let i = 0; i < winSize; i++) {
+      const s = channel[offset + i] * hann[i];
+      energy += s * s;
+      if (i > 0) {
+        const d = channel[offset + i] - channel[offset + i - 1];
+        diffEnergy += d * d;
+      }
+    }
+    const combined = Math.sqrt(energy) * 0.5 + Math.sqrt(diffEnergy) * 2;
+    flux[w] = Math.max(0, combined - prevEnergy);
+    prevEnergy = combined;
+  }
+
+  let maxFlux = 0;
+  for (let i = 0; i < flux.length; i++) if (flux[i] > maxFlux) maxFlux = flux[i];
+
+  const onsets = [];
+  const win = 30;
+  let lastOnsetTime = -1;
+
+  for (let i = 1; i < flux.length - 1; i++) {
+    let sum = 0, count = 0;
+    const lo = Math.max(0, i - win), hi = Math.min(flux.length, i + win);
+    for (let j = lo; j < hi; j++) { sum += flux[j]; count++; }
+    const localMean = sum / count;
+    let sqSum = 0;
+    for (let j = lo; j < hi; j++) {
+      sqSum += (flux[j] - localMean) ** 2;
+    }
+    const localStd = Math.sqrt(sqSum / count);
+    const threshold = localMean + localStd * 1.2;
+
+    if (flux[i] > threshold && flux[i] > flux[i-1] && flux[i] >= flux[i+1]) {
+      const t = (i * hopSize) / sr;
+      if (t - lastOnsetTime > 0.12) {
+        onsets.push({ t, strength: maxFlux > 0 ? flux[i] / maxFlux : 0 });
+        lastOnsetTime = t;
+      }
+    }
+  }
+
+  return onsets;
+}
+
+// =========================================================
+// 2) HARİTA — yerel yoğunluk duyarlı
+// =========================================================
+function computeLocalDensity(onsets, windowSec = 2) {
+  const density = new Array(onsets.length).fill(0);
+  let right = 0;
+  for (let i = 0; i < onsets.length; i++) {
+    if (right < i) right = i;
+    while (right < onsets.length && onsets[right].t - onsets[i].t < windowSec) right++;
+    density[i] = right - i;
+  }
+  return density;
+}
+
+function buildMap(onsets, duration) {
+  if (onsets.length === 0) return { map: [] };
+
+  const strengths = onsets.map(o => o.strength).sort((a,b) => a-b);
+  const median = strengths[Math.floor(strengths.length / 2)];
+  const p75 = strengths[Math.floor(strengths.length * 0.75)];
+  const p90 = strengths[Math.floor(strengths.length * 0.9)];
+
+  const density = computeLocalDensity(onsets, 2);
+
+  // Yoğunluk slider'ına göre eşikler
+  const baseThreshold = Math.max(median * (0.9 + densityMultiplier * 0.6), 0.14);
+  const minGap = 0.65 - densityMultiplier * 0.4; // 0.85 → 0.17
+  const maxObstacles = Math.floor(duration * (1.2 + densityMultiplier * 3));
+
+  const map = [];
+  let lastT = -999;
+  let spikes = 0, blocks = 0;
+
+  for (let idx = 0; idx < onsets.length; idx++) {
+    const o = onsets[idx];
+    const d = density[idx];
+
+    // Yerel yoğunluk düşükse eşiği düşür (sakin bölümde daha fazla engel)
+    // Yerel yoğunluk yüksekse eşiği yükselt (drop'ta daha seçici)
+    const localBoost = Math.max(0.55, Math.min(1.5, 10 / (d + 5)));
+    const threshold = baseThreshold * localBoost;
+
+    if (o.strength < threshold) continue;
+    if (o.t - lastT < minGap) continue;
+    if (map.length >= maxObstacles) break;
+
+    const type = o.strength > p75 ? 'spike' : 'block';
+    if (type === 'spike') spikes++; else blocks++;
+    map.push({ t: o.t, type, strength: o.strength });
+    lastT = o.t;
+  }
+
+  debugEl.textContent =
+    `Onset: ${onsets.length} → Engel: ${map.length} (%${(map.length/onsets.length*100).toFixed(0)}) • ` +
+    `Spike: ${spikes} Blok: ${blocks} • ` +
+    `Medyan: ${median.toFixed(3)} • P75: ${p75.toFixed(3)} • P90: ${p90.toFixed(3)}`;
+
+  return { map, median, p75, p90 };
+}
+
+// Performans: onset'leri zaman dilimlerine böl (titreşim için)
+function bucketOnsets(onsets, bucketSize = 0.5) {
+  const buckets = [];
+  for (const o of onsets) {
+    if (o.strength > 0.5) continue; // sadece zayıf vuruşlar titreşim yapar
+    const b = Math.floor(o.t / bucketSize);
+    if (!buckets[b]) buckets[b] = [];
+    buckets[b].push(o);
+  }
+  return { buckets, bucketSize };
+}
+
+function updateActiveVibrations(musicTime) {
+  activeVibrations = [];
+  if (musicTime < 0 || !vibrationToggle.checked) return;
+  if (!onsetBuckets.buckets) return;
+
+  // Görünür pencere + küçük buffer
+  const windowStart = musicTime - 0.5;
+  const windowEnd = musicTime + (W / PIXELS_PER_SEC) + 0.5;
+
+  const bStart = Math.max(0, Math.floor(windowStart / onsetBuckets.bucketSize));
+  const bEnd = Math.ceil(windowEnd / onsetBuckets.bucketSize);
+
+  for (let b = bStart; b <= bEnd; b++) {
+    const bucket = onsetBuckets.buckets[b];
+    if (!bucket) continue;
+    for (const o of bucket) {
+      if (o.t >= windowStart && o.t <= windowEnd) {
+        activeVibrations.push(o);
+      }
+    }
+  }
+}
+
+// =========================================================
+// 3) WAV YÜKLE → ANALİZ → OYNA
+// =========================================================
+async function loadWav(file) {
+  statusEl.textContent = '⏳ Dosya okunuyor...';
+  statusEl.className = 'warn';
+
+  if (!audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+  const arrayBuffer = await file.arrayBuffer();
+
+  statusEl.textContent = '⏳ Ses çözülüyor...';
+  audioBuffer = await audioCtx.decodeAudioData(arrayBuffer);
+  musicDuration = audioBuffer.duration;
+
+  statusEl.textContent = '🔍 Müzik analiz ediliyor...';
+  await new Promise(r => setTimeout(r, 30));
+
+  allOnsets = await analyzeOnsets(audioBuffer);
+  onsetBuckets = bucketOnsets(allOnsets);
+  const result = buildMap(allOnsets, musicDuration);
+  obstacleMap = result.map;
+
+  statusEl.textContent = `✅ ${obstacleMap.length} engel • ${allOnsets.length} vuruş • ${musicDuration.toFixed(1)}s • "${file.name}"`;
+  statusEl.className = 'ok';
+
+  startMusic();
+  startGame();
+}
+
+function startMusic() {
+  if (sourceNode) { try { sourceNode.stop(); } catch(e){} }
+  sourceNode = audioCtx.createBufferSource();
+  sourceNode.buffer = audioBuffer;
+  sourceNode.connect(audioCtx.destination);
+  playStartTime = audioCtx.currentTime + 0.05;
+  sourceNode.start(playStartTime);
+  musicPlaying = true;
+}
+
+function startGame() {
+  obstacles = [];
+  score = 0;
+  combo = 0;
+  maxCombo = 0;
+  nextOnsetIndex = 0;
+  speed = 5;
+  targetSpeed = 5;
+  player.y = GROUND_Y;
+  player.vy = 0;
+  player.onGround = true;
+  player.ducking = false;
+  player.hitCooldown = 0;
+  player.squish = 0;
+  scoreEl.textContent = '0';
+  comboEl.textContent = '0';
+  comboFill.style.width = '0%';
+}
+
+document.getElementById('file').addEventListener('change', e => {
+  const f = e.target.files[0];
+  if (f) loadWav(f);
+});
+
+// Slider değişince haritayı yeniden oluştur
+densitySlider.addEventListener('input', e => {
+  densityMultiplier = parseFloat(e.target.value);
+  densityVal.textContent = densityMultiplier.toFixed(2);
+  if (audioBuffer && allOnsets.length > 0) {
+    const result = buildMap(allOnsets, musicDuration);
+    obstacleMap = result.map;
+    startMusic();
+    startGame();
+  }
+});
+
+// =========================================================
+// 4) YOL
+// =========================================================
+function getMusicTime() {
+  if (!musicPlaying || !audioCtx) return -1;
+  return audioCtx.currentTime - playStartTime;
+}
+
+function getLineY(x) {
+  let y = GROUND_Y + Math.sin((x + time * 2) * 0.02) * 15;
+
+  if (activeVibrations.length > 0) {
+    const musicTime = getMusicTime();
+    if (musicTime >= 0) {
+      const xTime = musicTime + (W - x) / PIXELS_PER_SEC;
+      for (const o of activeVibrations) {
+        const dt = o.t - xTime;
+        if (Math.abs(dt) < 0.35) {
+          y -= Math.exp(-dt * dt * 60) * Math.min(o.strength, 0.5) * 25;
+        }
+      }
+    }
+  }
+  return y;
+}
+
+// =========================================================
+// 5) KONTROLLER
+// =========================================================
+document.addEventListener('keydown', e => {
+  if (['Space','ShiftLeft','ShiftRight'].includes(e.code)) e.preventDefault();
+  if (e.code === 'Space' && player.onGround) {
+    player.vy = -13;
+    player.onGround = false;
+    player.squish = 1; // zıplama animasyonu
+  }
+  if (e.code === 'ShiftLeft' || e.code === 'ShiftRight') player.ducking = true;
+});
+document.addEventListener('keyup', e => {
+  if (e.code === 'ShiftLeft' || e.code === 'ShiftRight') player.ducking = false;
+});
+
+// =========================================================
+// 6) SPAWN + DİNAMİK HIZ
+// =========================================================
+function spawnFromMap(musicTime) {
+  if (!musicPlaying) {
+    spawnTimer--;
+    if (spawnTimer <= 0) {
+      obstacles.push({
+        x: W + 60,
+        type: Math.random() < 0.55 ? 'spike' : 'block',
+        width: 44, height: 34, hit: false, passed: false
+      });
+      spawnTimer = 55 + Math.random() * 40;
+    }
+    return;
+  }
+
+  while (nextOnsetIndex < obstacleMap.length &&
+         obstacleMap[nextOnsetIndex].t <= musicTime + 0.1) {
+    const ev = obstacleMap[nextOnsetIndex];
+    obstacles.push({
+      x: W + 60,
+      type: ev.type,
+      width: 44, height: 34,
+      hit: false, passed: false
+    });
+    nextOnsetIndex++;
+  }
+}
+
+function updateDynamicSpeed(musicTime) {
+  if (musicTime < 0) { targetSpeed = 5; }
+  else {
+    // Önümüzdeki 2 saniyedeki engel sayısına göre
+    let nearby = 0;
+    for (let i = nextOnsetIndex; i < Math.min(obstacleMap.length, nextOnsetIndex + 10); i++) {
+      if (obstacleMap[i].t - musicTime <= 2) nearby++;
+      else break;
+    }
+    targetSpeed = 4 + nearby * 0.45;
+  }
+  speed += (targetSpeed - speed) * 0.05;
+}
+
+function update() {
+  time++;
+  const musicTime = getMusicTime();
+
+  if (musicDuration > 0 && musicTime >= 0) {
+    barFill.style.width = Math.min(100, (musicTime / musicDuration) * 100) + '%';
+  }
+
+  updateActiveVibrations(musicTime);
+  updateDynamicSpeed(musicTime);
+
+  // Yerçekimi
+  player.vy += 0.8;
+  player.y += player.vy;
+  const groundLevel = getLineY(player.x) - player.size;
+  if (player.y >= groundLevel) {
+    player.y = groundLevel;
+    player.vy = 0;
+    player.onGround = true;
+  }
+  if (player.hitCooldown > 0) player.hitCooldown--;
+  if (player.squish > 0) player.squish -= 0.1;
+
+  spawnFromMap(musicTime);
+
+  // Çarpışma
+  for (const o of obstacles) {
+    o.x -= speed;
+
+    const playerLeft = player.x;
+    const playerRight = player.x + player.size;
+    const playerTop = player.y + (player.ducking ? player.size * 0.5 : 0);
+    const playerBottom = player.y + player.size;
+
+    const baseY = getLineY(o.x + o.width / 2);
+    let obsTop, obsBottom;
+    if (o.type === 'spike') {
+      obsTop = baseY - o.height;
+      obsBottom = baseY;
+    } else {
+      obsTop = baseY - o.height - 50;
+      obsBottom = baseY - 50;
+    }
+
+    const xOverlap = playerRight > o.x && playerLeft < o.x + o.width;
+    const yOverlap = playerBottom > obsTop && playerTop < obsBottom;
+
+    if (xOverlap && yOverlap && !o.hit) {
+      o.hit = true;
+      combo = 0;
+      score = Math.max(0, score - 10);
+      player.hitCooldown = 20;
+    } else if (!o.hit && !o.passed && o.x + o.width < playerLeft) {
+      o.passed = true;
+      combo++;
+      if (combo > maxCombo) maxCombo = combo;
+      score += 5 + Math.min(combo, 10);
+    }
+  }
+
+  obstacles = obstacles.filter(o => o.x > -100);
+
+  scoreEl.textContent = Math.floor(score);
+  comboEl.textContent = combo;
+  comboFill.style.width = Math.min(100, combo * 8) + '%';
+}
+
+// =========================================================
+// 7) ÇİZİM
+// =========================================================
+function draw() {
+  ctx.clearRect(0, 0, W, H);
+
+  // Izgara
+  ctx.strokeStyle = '#1a1a1a';
+  ctx.lineWidth = 1;
+  for (let i = 0; i < W; i += 40) {
+    ctx.beginPath(); ctx.moveTo(i,0); ctx.lineTo(i,H); ctx.stroke();
+  }
+
+  // Yol çizgisi
+  ctx.strokeStyle = '#00ffcc';
+  ctx.lineWidth = 3;
+  ctx.beginPath();
+  for (let x = 0; x < W; x += 4) {
+    const y = getLineY(x);
+    x === 0 ? ctx.moveTo(x, y) : ctx.lineTo(x, y);
+  }
+  ctx.stroke();
+
+  // Engeller
+  for (const o of obstacles) {
+    const baseY = getLineY(o.x + o.width / 2);
+    if (o.type === 'spike') {
+      ctx.fillStyle = o.hit ? '#883344' : '#ff0066';
+      ctx.beginPath();
+      ctx.moveTo(o.x, baseY);
+      ctx.lineTo(o.x + o.width / 2, baseY - o.height);
+      ctx.lineTo(o.x + o.width, baseY);
+      ctx.closePath();
+      ctx.fill();
+    } else {
+      ctx.fillStyle = o.hit ? '#885522' : '#ffaa00';
+      ctx.fillRect(o.x, baseY - o.height - 50, o.width, o.height);
+    }
+  }
+
+  // Oyuncu (squish animasyonlu)
+  const baseH = player.ducking ? player.size * 0.5 : player.size;
+  const sq = Math.max(0, player.squish);
+  const ph = baseH * (1 - sq * 0.3);
+  const py = player.y + (player.ducking ? player.size * 0.5 : 0) + (baseH - ph);
+
+  ctx.fillStyle = player.hitCooldown > 0 ? '#ff4444' : '#ffffff';
+  ctx.fillRect(player.x, py, player.size, ph);
+
+  ctx.fillStyle = '#000';
+  ctx.fillRect(player.x + 7, py + 8, 5, 5);
+  ctx.fillRect(player.x + 18, py + 8, 5, 5);
+}
+
+function loop() {
+  update();
+  draw();
+  requestAnimationFrame(loop);
+}
+loop();
+</script>
+</body>
+</html>
